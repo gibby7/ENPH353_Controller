@@ -1,0 +1,7 @@
+<launch>
+    <node pkg="controller_pkg"
+        type="move_robot.py"
+        name="move_robot" 
+        output="screen">
+    </node>
+</launch>

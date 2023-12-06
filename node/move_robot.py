@@ -10,7 +10,9 @@ from cv_bridge import CvBridge
 import cv2
 import numpy as np
 from tensorflow.keras.models import load_model
-
+from gazebo_msgs.msg import ModelState
+from gazebo_msgs.srv import SetModelState
+from tf.transformations import quaternion_from_euler
 
 start = False
 start_time = 0
@@ -44,6 +46,8 @@ passed_truck = False
 on_grass = False
 passed_marked_road = False
 through_tunnel = False
+
+pink_detected = False
 
 # Load the model
 
@@ -89,10 +93,11 @@ class PIDController:
     
 controller = PIDController(.006, .000001, .001, 640)
 
+controller_grass = PIDController(.007, .0000035, .0025, 640)
 
 
 class MotionDetector:
-    def __init__(self, buffer_size=5, threshold=250000):
+    def __init__(self, buffer_size=5, threshold=300000):
         self.has_moved = True  # Default behavior: Assume movement initially
         self.buffer = []       # Buffer to store previous frames
         self.buffer_size = buffer_size  # Size of the buffer
@@ -123,6 +128,27 @@ def clock_callback(msg):
    global current_time_sec 
    current_time_sec = msg.clock.to_sec()
    #rospy.loginfo("Current simulation time (seconds): %f", current_time_sec)
+
+
+
+def teleport_to(position):
+
+   x,y,z,w = quaternion_from_euler(0,0,position[3])
+
+   msg = ModelState()
+   msg.model_name = 'R1'
+
+   msg.pose.position.x = position[0]
+   msg.pose.position.y = position[1]
+   msg.pose.position.z = position[2]
+   msg.pose.orientation.x = x
+   msg.pose.orientation.y = y
+   msg.pose.orientation.z = z
+   msg.pose.orientation.w = w
+
+   teleport(msg)
+
+   rospy.wait_for_service('/gazebo/set_model_state')
 
 
 
@@ -288,13 +314,9 @@ def grass_pid(img):
    # Sort contours by area (largest to smallest)
    contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
-   # Get the two largest contours
-   largest_contours = contours[:15]
-
-   # Create a mask image to draw the contours
+   # Get the largest contours
+   largest_contours = contours[:5]
    contour_mask = np.zeros_like(img)
-
-   # Draw the largest contours on the mask
    cv2.drawContours(contour_mask, largest_contours, -1, (255), thickness=cv2.FILLED)
 
    # Create an image with only the two largest contours
@@ -321,7 +343,7 @@ def grass_pid(img):
 
    print("Location = " + str(location))
 
-   turn = controller.compute(location)
+   turn = controller_grass.compute(location)
 
    move.linear.x = 0.25
    move.angular.z = turn
@@ -336,7 +358,7 @@ def check_red(img):
   lower_red = np.array([0, 100, 100])
   upper_red = np.array([10, 255, 255])  
   mask_red = cv2.inRange(red_hsv, lower_red, upper_red)
-  if np.sum(mask_red == 255)/np.size(mask_red) > .0165:
+  if np.sum(mask_red == 255)/np.size(mask_red) > .016:
     return True
   return False
 
@@ -371,6 +393,8 @@ def pid_callback(msg):
       global passed_pedestrian
       global passed_truck
       global on_grass
+      global passed_marked_road
+      global pink_detected
 
       # State 1: Start - Red Line
 
@@ -415,18 +439,47 @@ def pid_callback(msg):
       # State 3: Roundabout - Pink Line
 
       elif not on_grass:
-         if check_pink(img):
-            on_grass = True
+         if (check_pink(img)):
+            pink_detected = True
+         if pink_detected:
+            #on_grass = True
+            move.angular.z = 0
+            move.linear.x = -.1
+            if len(clue_values['TIME']['entries']) >= 3:
+               on_grass = True
+               teleport_to([-3.95, .472, .053, -2.506])
+
          else:
             road_pid(img)
 
       # State 4: Pink Line - End of Marked Road
       
+      #elif not passed_marked_road:
+         #if len(clue_values['MOTIVE']['entries']) >= 3:
+            #teleport_to([-4.09,-2.29,.053,0])
+            #passed_marked_road = True
+         #else:
+            #grass_pid(img)
+
       elif not passed_marked_road:
-         grass_pid(img)
-         pass
+         move.linear.x = -.1
+         move.angular.z = 0
+         if len(clue_values['MOTIVE']['entries']) >= 3:
+            teleport_to([-4.09,-2.29,.053,0])
+            passed_marked_road = True
+         else:
+            move.linear.x = -.1
+            move.angular.z = 0
+
+      # State 5: Post-Teleport
+      
       else:
-         grass_pid(img)
+         if len(clue_values['WEAPON']['entries']) >= 3:
+            score.publish("T12,123456,-1,end")
+            move.linear.x = 0
+         else:
+            move.linear.x = -.1
+            move.angular.z = 0
 
    except Exception as e:
       print(e)
@@ -439,6 +492,7 @@ score = rospy.Publisher('/score_tracker', String, queue_size=1)
 clk = rospy.Subscriber('/clock', Clock, clock_callback)
 cam = rospy.Subscriber('/R1/pi_camera/image_raw', Image, image_callback)
 pid = rospy.Subscriber('/R1/pi_camera/image_raw', Image, pid_callback)
+teleport = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
 rate = rospy.Rate(2)
 move = Twist()
 #move.linear.x = 0.0

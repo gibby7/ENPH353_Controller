@@ -13,7 +13,6 @@ from tensorflow.keras.models import load_model
 
 
 start = False
-on_grass = False
 start_time = 0
 current_time_sec = 0
 
@@ -39,13 +38,17 @@ clue_values = {
     "BANDIT": {'value': 8, 'entries': bandit_entries, 'submitted': False}
 }
 
-
-current_directory = os.path.dirname(os.path.abspath(__file__))
-
-# Specify the relative path to the model file
-model_file_path = os.path.join(current_directory, "reader.h5")
+# For checking state
+passed_pedestrian = False
+passed_truck = False
+on_grass = False
+passed_marked_road = False
+through_tunnel = False
 
 # Load the model
+
+current_directory = os.path.dirname(os.path.abspath(__file__))
+model_file_path = os.path.join(current_directory, "reader.h5")
 conv_model = load_model(model_file_path)
 
 # PID CONTROLLER
@@ -84,7 +87,36 @@ class PIDController:
 
         return output
     
-controller = PIDController(.005, .000001, .001, 640)
+controller = PIDController(.006, .000001, .001, 640)
+
+
+
+class MotionDetector:
+    def __init__(self, buffer_size=5, threshold=250000):
+        self.has_moved = True  # Default behavior: Assume movement initially
+        self.buffer = []       # Buffer to store previous frames
+        self.buffer_size = buffer_size  # Size of the buffer
+        self.threshold = threshold  # Threshold for significant change
+
+    def safe_to_move(self, image):
+        image = cv2.blur(image, (7,7))
+        if len(self.buffer) == self.buffer_size:
+            # Check for significant change between the current frame and the frame 10 frames ago
+            diff = np.sum(np.abs(self.buffer[-1] - self.buffer[0]))
+            print(diff)
+            if diff > self.threshold:
+                self.has_moved = False
+                self.buffer = []  # Clear buffer after detecting no movement
+                return not self.has_moved
+
+            # Remove the oldest frame to maintain the buffer size
+            self.buffer.pop(0)
+
+        self.buffer.append(image)  # Add current frame to the buffer
+        return not self.has_moved
+
+pedestrian_detector = MotionDetector()
+
 
 
 def clock_callback(msg):
@@ -113,15 +145,14 @@ def get_four_points(points):
         return None
    
 
+
 def image_callback(msg):
    try:
+      global score
       bridge = CvBridge()
       cv_image = bridge.imgmsg_to_cv2(msg, "bgr8")
 
       ### FROM COLAB
-
-      # Convert the image from BGR to RGB
-      image_rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
 
       # Define the lower and upper bounds for the blue color in HSV
       lower_blue = np.array([120, 60, 60])
@@ -135,16 +166,11 @@ def image_callback(msg):
 
       contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-      # Find the contour with the largest area
+      # Find the contour with the second largest area
       largest_contour = max(contours, key=cv2.contourArea)
-
-      # Exclude the largest contour from the list
       contours = [contour for contour in contours if contour is not largest_contour]
-
-      # Find the contour with the second-largest area
       second_largest_contour = max(contours, key=cv2.contourArea)
 
-      # Get the dimensions of the original image
       height, width = cv_image.shape[:2]
 
       # Define the coordinates of the rectangle in the original image
@@ -152,11 +178,7 @@ def image_callback(msg):
 
       def euclidean_norm(point):
           return np.linalg.norm(point)
-
-      # Sort the points by Euclidean norm
       sorted_points = np.array(sorted(rect_points, key=euclidean_norm))
-
-      #rect_points = np.array(sorted(rect_points, key=lambda x: (x[0], -x[1])))
 
       # Define the coordinates of the rectangle in the new image (the rectangle will become the full image)
       new_rect_points = np.array([[0, 0], [0, 399], [599, 0], [599, 399]], dtype=np.float32)
@@ -185,19 +207,19 @@ def image_callback(msg):
 
       prediction = conv_model.predict(top_letters)
 
-      clue_string = ""
+      clue_type = ""
 
       for i in prediction:
         max_index = np.argmax(i)
-        clue_string += chars[max_index]
+        clue_type += chars[max_index]
       
-      clue_string = clue_string.replace(" ","")
+      clue_type = clue_type.replace(" ","")
 
       # Add to list if a clue type
 
-      if clue_string in clue_values:
+      if clue_type in clue_values:
 
-         clue_type = clue_string
+         clue_string = ""
 
          prediction = conv_model.predict(bottom_letters)
          for i in prediction:
@@ -207,29 +229,12 @@ def image_callback(msg):
          clue_string = clue_string.replace(" ","")
          
          clue_values[clue_type]['entries'].append(clue_string)
-
-         for case_name, case_data in clue_values.items():
-            entries = case_data['entries']
-            submitted = case_data['submitted']
             
-            if len(entries) == 2 and not submitted:
-               unique_elements, counts = np.unique(entries, return_counts=True)
-               most_common_index = np.argmax(counts)
-               most_common_entry = unique_elements[most_common_index]
-               print("-")
-               print("-")
-               print("-")
-               print("-")
-               print("-")
-               print(f"Case {case_name}: Most common entry:", most_common_entry)
-               print("-")
-               print("-")
-               print("-")
-               print("-")
-               print("-")
-   
    except Exception as e:
       print(e)
+
+
+
 
 def road_pid(img):
    hsv_image = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -253,40 +258,109 @@ def road_pid(img):
    else:
       location = 640
 
-   location -= 50
+   location -= 70
 
    turn = controller.compute(location)
 
-   move.linear.x = 0.3
+   move.linear.x = 0.25
    move.angular.z = turn
 
-   print("Location = " + str(location))
-   print("Turn = " + str(turn))
+   #print("Location = " + str(location))
+   #print("Turn = " + str(turn))
+
+
 
 def grass_pid(img):
-   img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-   _, img = cv2.threshold(img,175,255,cv2.THRESH_BINARY)
-   img = cv2.morphologyEx(img, cv2.MORPH_ERODE, (3,3))
+   hsv_image = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-   pid_row = img[450, :]
+   # Define lower and upper threshold values for dark gray in HSV
+   lower_road = np.array([0, 28, 160])  
+   upper_road = np.array([50, 90, 255])  
 
-   nonzero_indices = np.nonzero(pid_row)[0]  # Get the indices of non-zero elements
+   # Create a mask using inRange() to detect dark gray regions in HSV
+   mask_road = cv2.inRange(hsv_image, lower_road, upper_road)
 
-   if len(nonzero_indices) > 0:
-      # Calculate the centroid (average position)
-      location = np.mean(nonzero_indices)
-   else:
-      location = 640
+   mask_road = cv2.morphologyEx(mask_road, cv2.MORPH_ERODE, (3,3))
+
+   # Find contours
+   contours, _ = cv2.findContours(mask_road, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+   # Sort contours by area (largest to smallest)
+   contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+   # Get the two largest contours
+   largest_contours = contours[:15]
+
+   # Create a mask image to draw the contours
+   contour_mask = np.zeros_like(img)
+
+   # Draw the largest contours on the mask
+   cv2.drawContours(contour_mask, largest_contours, -1, (255), thickness=cv2.FILLED)
+
+   # Create an image with only the two largest contours
+   contour_image = np.zeros_like(img)
+   contour_image[contour_mask == 255] = img[contour_mask == 255]
+
+   pid_row = contour_image[430:470, :]
+
+   nonzero_indices = [np.nonzero(row)[0] for row in pid_row]
+
+   # Calculate centroids along each row
+   centroids = []
+   for indices in nonzero_indices:
+      if len(indices) > 0:
+         centroid = np.mean(indices)
+         centroids.append(centroid)
+      else:
+         centroids.append(640)  # Default value if no non-zero elements are found
+
+   # Compute the average centroid position
+   location = np.mean(centroids)
 
    #location -= 50
 
+   print("Location = " + str(location))
+
    turn = controller.compute(location)
 
-   move.linear.x = 0.3
+   move.linear.x = 0.25
    move.angular.z = turn
 
-   print("Location = " + str(location))
-   print("Turn = " + str(turn))
+   #print("Location = " + str(location))
+   #print("Turn = " + str(turn))
+
+
+
+def check_red(img):
+  red_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+  lower_red = np.array([0, 100, 100])
+  upper_red = np.array([10, 255, 255])  
+  mask_red = cv2.inRange(red_hsv, lower_red, upper_red)
+  if np.sum(mask_red == 255)/np.size(mask_red) > .0165:
+    return True
+  return False
+
+
+
+def check_pink(img):
+  pink_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+  lower_pink = np.array([140, 100, 100]) 
+  upper_pink = np.array([170, 255, 255])
+  mask_pink = cv2.inRange(pink_hsv, lower_pink, upper_pink)
+  if np.sum(mask_pink == 255)/np.size(mask_pink) > .015:
+    return True
+  return False
+
+
+
+def check_truck(img):
+  lower_black = np.array([0, 0, 0], dtype=np.uint8)      # Lower threshold for black
+  upper_black = np.array([15, 15, 15], dtype=np.uint8)  # Upper threshold for black
+  black_mask = cv2.inRange(img, lower_black, upper_black)
+  print("Black Pixels: " + str(np.sum(black_mask == 255)))
+  if np.sum(black_mask == 255) > 300:
+    return True
+  return False
 
 
 
@@ -294,12 +368,69 @@ def pid_callback(msg):
    try:
       bridge = CvBridge()
       img = bridge.imgmsg_to_cv2(msg, "bgr8")  
+      global passed_pedestrian
+      global passed_truck
+      global on_grass
 
-      #CHECK THIS
-      grass_pid(img)
+      # State 1: Start - Red Line
+
+      if not passed_pedestrian:
+         if check_red(img):
+
+            hsv_image = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+            # Define a lower and upper HSV threshold for white skin tones
+            lower_blue = np.array([80, 40, 40])
+            upper_blue = np.array([110, 255, 255])  # Upper threshold for blue
+
+            # Create a mask using inRange to filter white skin tones
+            blue_mask = cv2.inRange(hsv_image, lower_blue, upper_blue)
+
+            move.linear.x = 0
+            move.angular.z = 0
+            safe = pedestrian_detector.safe_to_move(blue_mask[360:,450:920])
+            if safe:      
+               passed_pedestrian = True
+               pass
+         else:
+            road_pid(img)
+            
+      # State 2: Red Line - Roundabout
+
+      elif not passed_truck:
+
+         # check for truck when 3 clues submitted
+
+         submitted_count = sum(1 for clue in clue_values.values() if clue["submitted"])
+         if submitted_count >= 3:
+            move.linear.x = 0
+            move.angular.z = 0
+
+            if check_truck(img):
+               passed_truck = True
+
+         else:
+            road_pid(img)
+
+      # State 3: Roundabout - Pink Line
+
+      elif not on_grass:
+         if check_pink(img):
+            on_grass = True
+         else:
+            road_pid(img)
+
+      # State 4: Pink Line - End of Marked Road
+      
+      elif not passed_marked_road:
+         grass_pid(img)
+         pass
+      else:
+         grass_pid(img)
 
    except Exception as e:
       print(e)
+
 
 
 rospy.init_node('pub_sub_node')
@@ -313,13 +444,34 @@ move = Twist()
 #move.linear.x = 0.0
 #move.angular.z = 0.0
 
+
+
 rospy.sleep(1)
 
 while not rospy.is_shutdown():
    if not start:
-      score.publish("TEAM,pword,0,BALLS")
+      score.publish("T12,123456,0,BALLS")
       start = True
       start_time = rospy.Time.now().to_sec()
    
+   for case_name, case_data in clue_values.items():
+      entries = case_data['entries']
+      submitted = case_data['submitted']
+
+      threshold = 2
+      submitted_count = sum(1 for clue in clue_values.values() if clue['submitted'])
+
+      if submitted_count >= 3:
+         threshold = 1
+
+      if len(entries) >= threshold:
+         unique_elements, counts = np.unique(entries, return_counts=True)
+         most_common_index = np.argmax(counts)
+         most_common_entry = unique_elements[most_common_index]
+         print(f"Case {case_name}: Most common entry:", most_common_entry)
+         score.publish("T12,123456," + str(clue_values[case_name]['value']) + "," + most_common_entry)
+
+         clue_values[case_name]['submitted'] = True
+
    cmd.publish(move)
    rate.sleep()
